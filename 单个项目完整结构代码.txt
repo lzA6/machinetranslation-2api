@@ -1,0 +1,563 @@
+项目 'machinetranslation-2api' 的结构树:
+📂 machinetranslation-2api/
+    📄 .env
+    📄 .env.example
+    📄 Dockerfile
+    📄 docker-compose.yml
+    📄 main.py
+    📄 nginx.conf
+    📄 requirements.txt
+    📂 app/
+        📂 core/
+            📄 __init__.py
+            📄 config.py
+        📂 providers/
+            📄 __init__.py
+            📄 base_provider.py
+            📄 machinetranslation_provider.py
+        📂 utils/
+            📄 sse_utils.py
+================================================================================
+
+--- 文件路径: .env ---
+
+# ====================================================================
+# machinetranslation-2api 配置文件模板
+# ====================================================================
+#
+# 请将此文件重命名为 ".env" 并按需修改。
+#
+
+# --- 核心安全配置 (必须设置) ---
+# 用于保护您 API 服务的访问密钥。
+API_MASTER_KEY=1
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+
+--- 文件路径: .env.example ---
+
+# ====================================================================
+# machinetranslation-2api 配置文件模板
+# ====================================================================
+#
+# 请将此文件重命名为 ".env" 并按需修改。
+#
+
+# --- 核心安全配置 (必须设置) ---
+# 用于保护您 API 服务的访问密钥。
+API_MASTER_KEY=sk-machinetranslation-2api-default-key
+
+# --- 部署配置 (可选) ---
+# Nginx 对外暴露的端口
+NGINX_PORT=8088
+
+
+--- 文件路径: Dockerfile ---
+
+# ====================================================================
+# Dockerfile for machinetranslation-2api (v1.0)
+# ====================================================================
+
+FROM python:3.10-slim
+
+# 设置环境变量
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+WORKDIR /app
+
+# 安装 Python 依赖
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# 复制应用代码
+COPY . .
+
+# 创建并切换到非 root 用户
+RUN useradd --create-home appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+# 暴露端口并启动
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+
+
+--- 文件路径: docker-compose.yml ---
+
+services:
+  nginx:
+    image: nginx:latest
+    container_name: machinetranslation-2api-nginx
+    restart: always
+    ports:
+      - "${NGINX_PORT:-8088}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    networks:
+      - mt-net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: machinetranslation-2api-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - mt-net
+
+networks:
+  mt-net:
+    driver: bridge
+
+
+--- 文件路径: main.py ---
+
+import sys
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException, Depends, Header
+from fastapi.responses import JSONResponse, StreamingResponse
+from loguru import logger
+
+from app.core.config import settings
+from app.providers.machinetranslation_provider import MachineTranslationProvider
+
+# --- 终极日志配置 ---
+logger.remove()
+logger.add(
+    sys.stdout,
+    level="TRACE",  # 将日志级别调整为 TRACE 以查看所有细节
+    format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+           "<level>{level: <8}</level> | "
+           "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+    colorize=True,
+    serialize=False
+)
+
+provider: Optional[MachineTranslationProvider] = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global provider
+    logger.info(f"应用启动中... {settings.APP_NAME} v{settings.APP_VERSION}")
+    provider = MachineTranslationProvider()
+    logger.info(f"服务将在 http://localhost:{settings.NGINX_PORT} 上可用")
+    yield
+    logger.info("应用关闭。")
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description=settings.DESCRIPTION,
+    lifespan=lifespan
+)
+
+async def verify_api_key(authorization: Optional[str] = Header(None)):
+    if settings.API_MASTER_KEY and settings.API_MASTER_KEY != "1":
+        if not authorization or "bearer" not in authorization.lower():
+            raise HTTPException(status_code=401, detail="需要 Bearer Token 认证。")
+        token = authorization.split(" ")[-1]
+        if token != settings.API_MASTER_KEY:
+            raise HTTPException(status_code=403, detail="无效的 API Key。")
+
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
+async def chat_completions(request: Request):
+    """
+    核心聊天补全端点。
+    为了确保与所有客户端（如 Cherry Studio）的最佳兼容性，
+    此端点现在始终以流式（text/event-stream）方式响应。
+    """
+    request_data = await request.json()
+    return StreamingResponse(
+        provider.translate_stream(request_data), 
+        media_type="text/event-stream"
+    )
+
+@app.get("/v1/models", dependencies=[Depends(verify_api_key)])
+async def list_models():
+    return await provider.get_models()
+
+@app.get("/", summary="根路径")
+def root():
+    return {"message": f"欢迎来到 {settings.APP_NAME} v{settings.APP_VERSION}. 服务运行正常。"}
+
+
+--- 文件路径: nginx.conf ---
+
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream mt_backend {
+        server app:8000;
+    }
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        location / {
+            proxy_pass http://mt_backend;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            
+            # 非流式 API，但保留是良好实践
+            proxy_read_timeout 300s;
+            proxy_connect_timeout 75s;
+        }
+    }
+}
+
+
+--- 文件路径: requirements.txt ---
+
+fastapi
+uvicorn[standard]
+pydantic-settings
+python-dotenv
+httpx
+loguru
+
+
+--- 文件路径: app\core\__init__.py ---
+
+
+
+--- 文件路径: app\core\config.py ---
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import List, Optional
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding='utf-8',
+        extra="ignore"
+    )
+
+    APP_NAME: str = "machinetranslation-2api"
+    APP_VERSION: str = "1.0.0"
+    DESCRIPTION: str = "一个将 machinetranslation.com 转换为兼容 OpenAI 格式 API 的高性能代理。"
+
+    API_MASTER_KEY: Optional[str] = "sk-machinetranslation-2api-default-key"
+    NGINX_PORT: int = 8088
+
+    # 上游 API 配置
+    # 从抓包中提取的静态 API Key
+    MT_API_KEY: str = "pDwCjq7CyeAmn1Z3osNunACg2U0SLIhwBTtsp1WqYFMf5UuSIvMBYGS4pt8OIsGMH"
+    BASE_API_URL: str = "https://api.machinetranslation.com/v1"
+    SOCKET_URL: str = "https://ss.machinetranslation.com"
+    
+    API_REQUEST_TIMEOUT: int = 120
+    SOCKET_TIMEOUT: int = 60 # 等待 socket.io 结果的超时时间
+
+    # 模型列表
+    KNOWN_MODELS: List[str] = [
+        "machinetranslation-best", "chat_gpt", "gemini", "claude", "libre", "mistral_ai", "smart"
+    ]
+    DEFAULT_MODEL: str = "machinetranslation-best"
+    # 用于获取最终评分报告的模型
+    SCORER_MODEL: str = "gpt-4o-mini"
+    # 翻译请求中要包含的模型列表
+    LLM_LIST_FOR_REQUEST: List[str] = ["chat_gpt", "gemini", "claude", "libre", "mistral_ai"]
+
+
+settings = Settings()
+
+
+--- 文件路径: app\providers\__init__.py ---
+
+
+
+--- 文件路径: app\providers\base_provider.py ---
+
+from abc import ABC, abstractmethod
+from typing import Dict, Any
+from fastapi.responses import StreamingResponse, JSONResponse
+
+class BaseProvider(ABC):
+    @abstractmethod
+    async def chat_completion(
+        self,
+        request_data: Dict[str, Any]
+    ) -> StreamingResponse:
+        pass
+
+    @abstractmethod
+    async def get_models(self) -> JSONResponse:
+        pass
+
+
+--- 文件路径: app\providers\machinetranslation_provider.py ---
+
+import asyncio
+import json
+import time
+import uuid
+import re
+from typing import Dict, Any, List, AsyncGenerator
+
+import httpx
+from fastapi import HTTPException
+from loguru import logger
+
+from app.core.config import settings
+from app.utils.sse_utils import create_sse_data, create_chat_completion_chunk, DONE_CHUNK
+
+# --- 终极日志模块 ---
+async def log_request(request):
+    logger.debug(f">>> REQUEST: {request.method} {request.url}")
+    logger.trace(f"    HEADERS: {request.headers}")
+    try:
+        content = request.content.decode('utf-8')
+        if content: logger.trace(f"    BODY: {content}")
+    except (UnicodeDecodeError, AttributeError):
+        pass
+
+async def log_response(response):
+    await response.aread()
+    logger.debug(f"<<< RESPONSE: {response.status_code} {response.request.method} {response.request.url}")
+    logger.trace(f"    HEADERS: {response.headers}")
+    try:
+        content = response.text
+        if content: logger.trace(f"    BODY: {content}")
+    except Exception:
+        pass
+# --- 终极日志模块结束 ---
+
+
+class MachineTranslationProvider:
+    def __init__(self):
+        self.client = httpx.AsyncClient(
+            timeout=settings.API_REQUEST_TIMEOUT,
+            event_hooks={'request': [log_request], 'response': [log_response]}
+        )
+        self.base_headers = {
+            "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Origin": "https://www.machinetranslation.com",
+            "Referer": "https://www.machinetranslation.com/",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36",
+        }
+        self.api_headers = {**self.base_headers, "api-key": settings.MT_API_KEY}
+
+    async def _get_share_id(self, text: str, source_lang: str, target_lang: str) -> str:
+        url = f"{settings.BASE_API_URL}/translation/share-id"
+        payload = {
+            "text": text, "source_language_code": source_lang, "target_language_code": target_lang,
+            "s3_file_path": None, "total_words": None, "secure_mode": False,
+            "total_words_in_file": None, "is_doc_translation_disabled": False, "doc_translation_disabled_reason": ""
+        }
+        response = await self.client.post(url, headers=self.api_headers, json=payload)
+        response.raise_for_status()
+        data = response.json()
+        share_id = data.get("share_id")
+        if not share_id: raise ValueError("API 响应中缺少 'share_id'")
+        logger.info(f"成功获取 share_id: {share_id}")
+        return share_id
+
+    async def _manual_socket_io_flow(self, share_id: str) -> List[Dict]:
+        sid = None
+        try:
+            t_param = f"{int(time.time() * 1000)}"
+            handshake_url = f"{settings.SOCKET_URL}/socket.io/?EIO=4&transport=polling&t={t_param}"
+            logger.info(f"[Socket-IO] 步骤 1: 发送握手请求")
+            response = await self.client.get(handshake_url, headers=self.base_headers)
+            response.raise_for_status()
+            
+            raw_data = response.text
+            match = re.search(r'"sid":"([^"]+)"', raw_data)
+            if not match: raise ValueError("无法从握手响应中解析 sid")
+            sid = match.group(1)
+            logger.success(f"[Socket-IO] 成功获取 sid: {sid}")
+
+            post_url = f"{settings.SOCKET_URL}/socket.io/?EIO=4&transport=polling&sid={sid}"
+            
+            connect_payload = f'40{json.dumps({"shareId": share_id}, separators=(",", ":"))}'
+            logger.info("[Socket-IO] 步骤 2a: 发送带 shareId 的 CONNECT (40) 包")
+            await self.client.post(post_url, headers={**self.base_headers, "Content-Type": "text/plain;charset=UTF-8"}, data=connect_payload.encode('utf-8'))
+            
+            event_payload = f'42["llm:translation:request",{{"shareId":"{share_id}","llmList":{json.dumps(settings.LLM_LIST_FOR_REQUEST)}}}]'
+            logger.info(f"[Socket-IO] 步骤 2b: 发送 EVENT 包")
+            await self.client.post(post_url, headers={**self.base_headers, "Content-Type": "text/plain;charset=UTF-8"}, data=event_payload.encode('utf-8'))
+
+            logger.info("[Socket-IO] 步骤 3: 开始长轮询获取结果...")
+            results = []
+            start_time = time.time()
+            expected_results = len(settings.LLM_LIST_FOR_REQUEST)
+
+            while time.time() - start_time < settings.SOCKET_TIMEOUT and len(results) < expected_results:
+                t_param = f"{int(time.time() * 1000)}"
+                poll_url = f"{settings.SOCKET_URL}/socket.io/?EIO=4&transport=polling&t={t_param}&sid={sid}"
+                
+                try:
+                    poll_response = await self.client.get(poll_url, headers=self.base_headers, timeout=30)
+                    poll_response.raise_for_status()
+                    raw_poll_data = poll_response.text
+                    
+                    packets = raw_poll_data.split('')
+                    for packet in packets:
+                        if not packet: continue
+                        if packet == '2':
+                            logger.info("[Socket-IO] 收到 PING(2)，立即回复 PONG(3)")
+                            await self.client.post(post_url, headers=self.base_headers, content='3')
+                            continue
+                        if packet.startswith('44'):
+                            raise Exception(f"上游拒绝会话: {packet}")
+                        if packet.startswith('42'):
+                            logger.success(f"[Socket-IO] 收到数据包: {packet}")
+                            try:
+                                data = json.loads(packet[2:])
+                                if data[0] == "llm:translation:response":
+                                    results.append(data[1])
+                                    logger.success(f"成功解析翻译结果 ({data[1].get('llm')})。进度: {len(results)}/{expected_results}")
+                            except (json.JSONDecodeError, IndexError):
+                                logger.warning(f"无法解析事件包: {packet}")
+                except httpx.ReadTimeout:
+                    logger.info("[Socket-IO] 轮询超时，继续...")
+                    continue
+                except Exception as e:
+                    logger.error(f"[Socket-IO] 轮询期间发生错误: {e}")
+                    break
+            return results
+        except Exception as e:
+            logger.error(f"手动 Socket.IO 流程失败: {e}", exc_info=True)
+            return []
+
+    async def _get_final_scores(self, share_id: str) -> Dict:
+        url = f"{settings.BASE_API_URL}/translation/score_test/{share_id}/{settings.SCORER_MODEL}"
+        await asyncio.sleep(5)
+        response = await self.client.post(url, headers=self.api_headers, content=b'', timeout=60)
+        response.raise_for_status()
+        data = response.json()
+        logger.success(f"成功获取 share_id '{share_id}' 的最终评分报告。")
+        return data
+
+    def _format_markdown_content(self, model: str, final_data: Dict) -> str:
+        translations = final_data.get("translations", [])
+        if not translations:
+            return "错误：上游未返回任何翻译结果。"
+
+        best_translation = max(translations, key=lambda t: t.get("score") or 0)
+        
+        if model == "machinetranslation-best":
+            main_content = best_translation.get("target_text", "No translation found.")
+        else:
+            specific_model_translation = next((t for t in translations if t.get("engine") == model), best_translation)
+            main_content = specific_model_translation.get("target_text", "No translation found.")
+
+        final_content = main_content.strip()
+        final_content += "\n\n---\n\n### 详细翻译报告\n"
+        
+        sorted_translations = sorted(translations, key=lambda t: t.get("score") or 0, reverse=True)
+        
+        for t in sorted_translations:
+            engine = t.get("engine", "N/A")
+            score = t.get("score")
+            score_str = f"{score:.2f}" if score is not None else "N/A"
+            text = t.get("target_text", "").strip()
+            
+            final_content += f"\n**模型: {engine}** (评分: {score_str})\n"
+            final_content += f"> {text}\n"
+        
+        return final_content
+
+    async def translate_stream(self, request_data: Dict[str, Any]) -> AsyncGenerator[bytes, None]:
+        request_id = f"chatcmpl-{uuid.uuid4()}"
+        model = request_data.get("model", settings.DEFAULT_MODEL)
+        
+        try:
+            messages = request_data.get("messages", [])
+            text_to_translate = next((m['content'] for m in reversed(messages) if m.get('role') == 'user'), None)
+            if not text_to_translate:
+                raise HTTPException(status_code=400, detail="未找到用户输入内容。")
+
+            share_id = await self._get_share_id(text_to_translate, "auto", "en")
+            
+            socket_results = await self._manual_socket_io_flow(share_id)
+            if not socket_results:
+                logger.warning("Socket 流程未返回结果，但仍尝试获取最终评分报告...")
+            
+            final_data = await self._get_final_scores(share_id)
+            
+            if not final_data.get("translations"):
+                 raise HTTPException(status_code=502, detail="上游未返回任何翻译结果。")
+
+            markdown_content = self._format_markdown_content(model, final_data)
+
+            # 以流的形式一次性发送所有内容
+            chunk = create_chat_completion_chunk(request_id, model, markdown_content)
+            yield create_sse_data(chunk)
+
+            # 发送结束标志
+            final_chunk = create_chat_completion_chunk(request_id, model, "", finish_reason="stop")
+            yield create_sse_data(final_chunk)
+
+        except Exception as e:
+            logger.error(f"流式处理中发生错误: {e}", exc_info=True)
+            error_message = f"处理请求时发生错误: {str(e)}"
+            chunk = create_chat_completion_chunk(request_id, model, error_message, finish_reason="error")
+            yield create_sse_data(chunk)
+        
+        finally:
+            yield DONE_CHUNK
+
+    async def get_models(self) -> Dict:
+        return {
+            "object": "list",
+            "data": [
+                {"id": name, "object": "model", "created": int(time.time()), "owned_by": "lzA6"}
+                for name in settings.KNOWN_MODELS
+            ]
+        }
+
+
+--- 文件路径: app\utils\sse_utils.py ---
+
+import json
+import time
+from typing import Dict, Any, Optional
+
+DONE_CHUNK = b"data: [DONE]\n\n"
+
+def create_sse_data(data: Dict[str, Any]) -> bytes:
+    """将字典数据格式化为 SSE 事件字符串。"""
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode('utf-8')
+
+def create_chat_completion_chunk(
+    request_id: str,
+    model: str,
+    content: str,
+    finish_reason: Optional[str] = None
+) -> Dict[str, Any]:
+    """创建一个与 OpenAI 兼容的聊天补全流式块。"""
+    return {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": content},
+                "finish_reason": finish_reason
+            }
+        ]
+    }
+
+
+
